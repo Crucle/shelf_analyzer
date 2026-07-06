@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 @dataclass
 class ShelfDiff:
     shelf_number: int           
-    expected: list              
-    actual: list                
+    expected: list               
+    actual: list                 
     positions: list = field(default_factory=list)  
     missing: list = field(default_factory=list)    
     extra: list = field(default_factory=list)       
@@ -77,6 +77,27 @@ def compare_to_planogram(actual_rows: list, planogram: list) -> list:
             )
         )
     return diffs
+
+
+def violations_as_messages(diffs: list) -> list:
+    messages = []
+    for d in diffs:
+        for p in d.positions:
+            if p["status"] == "wrong_item":
+                messages.append(
+                    f'Полка {d.shelf_number}, место {p["position"]}: должен стоять '
+                    f'"{p["expected"]}", а фактически стоит "{p["actual"]}"'
+                )
+            elif p["status"] == "missing":
+                messages.append(
+                    f'Полка {d.shelf_number}, место {p["position"]}: отсутствует товар "{p["expected"]}"'
+                )
+            elif p["status"] == "extra":
+                messages.append(
+                    f'Полка {d.shelf_number}, место {p["position"]}: лишний товар "{p["actual"]}" '
+                    f'— по планограмме здесь его быть не должно'
+                )
+    return messages
 
 
 def summarize(diffs: list) -> dict:
