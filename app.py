@@ -53,13 +53,8 @@ def main():
     if image is None:
         st.error("Не удалось открыть изображение. Попробуйте другой файл.")
         return
-    img_h, img_w = image.shape[:2]
 
-    # Автообрезка (см. detector.auto_crop) считается один раз для
-    # каждого нового загруженного фото и служит стартовым значением
-    # ползунков — дальше пользователь может подправить их вручную, если
-    # автоматика ошиблась. Пересчитываем только когда меняется само фото
-    # (а не при каждом перерисовывании страницы).
+    img_h, img_w = image.shape[:2]
     file_key = f"{uploaded_file.name}:{uploaded_file.size}"
     if st.session_state.get("_crop_file_key") != file_key:
         st.session_state["_crop_file_key"] = file_key
@@ -130,6 +125,7 @@ def main():
                 "но малоуверенного варианта."
             ),
         )
+
         st.subheader("Эталонные фото-примеры (по желанию)")
         st.caption(
             "Если модель путает похожие товары (например, две прозрачные "
@@ -297,7 +293,7 @@ def main():
 
     if has_planogram:
         st.divider()
-        st.header("📐 Сравнение с планограммой")
+        st.header("📐 Стоят ли товары на своих местах")
 
         actual_rows = labels_by_row(boxes, labels)
         diffs = compare_to_planogram(actual_rows, planogram)
@@ -305,27 +301,32 @@ def main():
 
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("Соответствие планограмме", f"{plano_summary['match_percent']}%")
-        p2.metric("Отсутствует товаров", plano_summary["total_missing"])
-        p3.metric("Лишних товаров", plano_summary["total_extra"])
-        p4.metric("Полок с неверным порядком", plano_summary["shelves_with_order_issues"])
+        p2.metric("Не на своём месте", plano_summary["wrong_item_positions"])
+        p3.metric("Отсутствует товаров", plano_summary["total_missing"])
+        p4.metric("Лишних товаров", plano_summary["total_extra"])
+
         if plano_summary["is_fully_correct"]:
-            st.success("Выкладка полностью соответствует планограмме.")
+            st.success("Все товары стоят на своих местах согласно планограмме.")
+
+        status_icon = {"correct": "✅", "wrong_item": "❌", "missing": "⬜", "extra": "➕"}
+        status_text = {
+            "correct": "на месте",
+            "wrong_item": "не тот товар",
+            "missing": "отсутствует",
+            "extra": "лишний",
+        }
+
         for d in diffs:
             with st.container(border=True):
                 st.write(f"**Полка {d.shelf_number}**")
-                cA, cB = st.columns(2)
-                cA.write("Ожидалось:")
-                cA.write(", ".join(d.expected) if d.expected else "—")
-                cB.write("Найдено:")
-                cB.write(", ".join(d.actual) if d.actual else "—")
-                if d.missing:
-                    st.warning(f"Отсутствуют: {', '.join(d.missing)}")
-                if d.extra:
-                    st.warning(f"Лишние: {', '.join(d.extra)}")
-                if not d.order_correct and not d.missing and not d.extra:
-                    st.warning("Неправильный порядок расположения товаров")
-                if not d.missing and not d.extra and d.order_correct:
-                    st.success("Полка соответствует планограмме")
+                rows = ["| Место | Статус | Должен быть | Фактически |", "|---|---|---|---|"]
+                for p in d.positions:
+                    icon = status_icon[p["status"]]
+                    text = status_text[p["status"]]
+                    expected = p["expected"] or "—"
+                    actual = p["actual"] or "—"
+                    rows.append(f"| {p['position']} | {icon} {text} | {expected} | {actual} |")
+                st.markdown("\n".join(rows))
 
     with st.expander("Полный отчёт (JSON)"):
         st.json(report)
