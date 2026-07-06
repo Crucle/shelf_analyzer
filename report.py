@@ -34,7 +34,9 @@ def build_layout_report(
     boxes: list[BBox],
     labels: list[str],
     violations: list[Violation],
+    extra_violations: list[str] = None,
 ) -> dict:
+    extra_violations = extra_violations or []
     brands_found = sorted(set(labels)) if labels else []
     shelves_recognized = len(group_into_rows(boxes))
     compliance = _compliance_percent(brands_found, violations)
@@ -42,6 +44,9 @@ def build_layout_report(
     total_products = sum(b.count for b in boxes)
     positions_detected = len(boxes)
     has_estimated = any(b.count > 1 for b in boxes)
+
+    all_violation_messages = [v.message for v in violations] + list(extra_violations)
+    total_violations = len(all_violation_messages)
 
     warnings: list[str] = []
     oversized = _find_oversized_boxes(boxes, image_area)
@@ -70,18 +75,18 @@ def build_layout_report(
             f"{' (оценочно)' if has_estimated else ''}, представлены бренды: "
             f"{', '.join(brands_found)}. Соответствие выкладки оценено в "
             f"{compliance}% — {_compliance_comment(compliance)}. "
-            f"Критических нарушений: {len(violations)}."
+            f"Критических нарушений: {total_violations}."
         )
 
     return {
         "compliance_percent": compliance,
-        "critical_violations_count": len(violations),
+        "critical_violations_count": total_violations,
         "shelves_recognized": shelves_recognized,
         "total_products": total_products,
         "positions_detected": positions_detected,
         "count_is_estimated": has_estimated,
         "brands_found": brands_found,
         "summary": summary,
-        "critical_violations": [v.message for v in violations],
+        "critical_violations": all_violation_messages,
         "warnings": warnings,
     }
