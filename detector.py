@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-
 _TYPICAL_ITEM_ASPECT = 0.3
 
 
@@ -89,6 +88,7 @@ def _split_by_color(
 
     def smooth(arr, k=15):
         return np.convolve(arr, np.ones(k) / k, mode="same")
+
     feat_hue = smooth(weighted_hue) / 180.0
     feat_sat = smooth(mean_sat) / 255.0
     feat_val = smooth(mean_val) / 255.0
@@ -118,6 +118,7 @@ def _split_by_color(
     for i in range(len(boundaries) - 1):
         seg_start, seg_end = boundaries[i], boundaries[i + 1]
         if seg_end - seg_start < min_len:
+            if segments:
                 segments[-1] = (segments[-1][0], seg_end)
             else:
                 boundaries[i + 1] = boundaries[i]
@@ -128,6 +129,8 @@ def _split_by_color(
         return [(x1, x2)]
 
     return [(x1 + s, x1 + e) for s, e in segments]
+
+
 def _estimate_count(width: int, height: int) -> int:
     if height <= 0:
         return 1
@@ -135,6 +138,8 @@ def _estimate_count(width: int, height: int) -> int:
     if single_item_width <= 0:
         return 1
     return max(1, round(width / single_item_width))
+
+
 def detect_products(
     image: np.ndarray,
     min_area_ratio: float = 0.002,
@@ -154,7 +159,6 @@ def detect_products(
     col_ranges = _find_occupied_ranges(
         col_profile, thresh_frac=0.12, min_len_frac=0.03, gap_merge=5
     )
-
     color_split_ranges: list[tuple[int, int]] = []
     for x1, x2 in col_ranges:
         color_split_ranges.extend(_split_by_color(image, x1, x2))
@@ -186,7 +190,6 @@ def auto_crop(image: np.ndarray, sharpness_thresh_frac: float = 0.15) -> tuple[i
     h_img, w_img = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
-
     band = lap[h_img // 3 : 2 * h_img // 3, :]
     col_sharpness = band.var(axis=0)
     col_smooth = np.convolve(col_sharpness, np.ones(21) / 21, mode="same")
