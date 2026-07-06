@@ -7,9 +7,19 @@ import numpy as np
 from brand_classifier import classify_brands
 from detector import BBox, auto_crop, detect_products
 from layout_checker import check_layout, group_into_rows
-from planogram import compare_to_planogram, load_planogram, summarize as summarize_planogram
+from planogram import compare_to_planogram, load_planogram, violations_as_messages, summarize as summarize_planogram
 from report import build_layout_report
 from visualizer import draw_result
+
+# Бренды для нашего тестового фото прилавка с напитками — с описанием
+# отличительных признаков (цвет крышки/этикетки, логотип). Это заметно
+# точнее, чем просто список названий: товары с похожим цветом (например,
+# две прозрачные бутылки — Schweppes и BonAqua) CLIP различает по одному
+# общему шаблону фразы гораздо хуже, чем по конкретному описанию внешнего
+# вида. Можно указать несколько описаний на бренд — они усредняются
+# ("prompt ensembling", см. brand_classifier.py). Поменяйте под свои
+# товары — это единственное, что нужно изменить, чтобы применить
+# программу к другой категории.
 DEFAULT_BRANDS = {
     "Coca-Cola": [
         "a photo of a dark cola soft drink bottle with a red logo and red bottle cap",
@@ -118,6 +128,11 @@ def analyze(
         x1, y1, x2, y2 = crop
         image = image[y1:y2, x1:x2]
     elif use_auto_crop:
+        # Пользователь не указал область вручную — пробуем сами найти
+        # прилавок по резкости (см. detector.auto_crop) и убрать
+        # размытый фон (соседние стеллажи). Если чёткой границы не
+        # нашлось, auto_crop честно вернёт границы всего изображения —
+        # тогда просто ничего не обрезаем.
         x1, y1, x2, y2 = auto_crop(image)
         image = image[y1:y2, x1:x2]
 
@@ -249,7 +264,20 @@ def main():
         args.image, brands, crop, args.rows, reference_images, use_auto_crop=not args.no_auto_crop
     )
     image_area = image.shape[0] * image.shape[1]
-    report = build_layout_report(image_area, boxes, labels, violations)
+
+    # Если задана планограмма — считаем сравнение ЗАРАНЕЕ, чтобы найденные
+    # несоответствия ("не тот товар", "отсутствует", "лишний") сразу
+    # вошли в общий список критических нарушений и в текстовое резюме
+    # отчёта, а не остались отдельным списком в стороне.
+    plano_diffs = None
+    plano_messages: list[str] = []
+    if args.planogram:
+        planogram = load_planogram(args.planogram)
+        actual_rows = labels_by_row(boxes, labels)
+        plano_diffs = compare_to_planogram(actual_rows, planogram)
+        plano_messages = violations_as_messages(plano_diffs)
+
+    report = build_layout_report(image_area, boxes, labels, violations, extra_violations=plano_messages)
 
     print("=" * 60)
     print("ОТЧЁТ О ВЫКЛАДКЕ")
@@ -274,15 +302,12 @@ def main():
         for v in report["critical_violations"]:
             print(f"  — {v}")
 
-    if args.planogram:
-        planogram = load_planogram(args.planogram)
-        actual_rows = labels_by_row(boxes, labels)
-        diffs = compare_to_planogram(actual_rows, planogram)
-        plano_summary = summarize_planogram(diffs)
+    if plano_diffs is not None:
+        plano_summary = summarize_planogram(plano_diffs)
 
         print()
         print("=" * 60)
-        print("СРАВНЕНИЕ С ПЛАНОГРАММОЙ — СТОЯТ ЛИ ТОВАРЫ НА СВОИХ МЕСТАХ")
+        print("ПОДРОБНО ПО ПЛАНОГРАММЕ — СТОЯТ ЛИ ТОВАРЫ НА СВОИХ МЕСТАХ")
         print("=" * 60)
         print(f"Соответствие планограмме:  {plano_summary['match_percent']}%")
         print(f"Верных позиций:            {plano_summary['correct_positions']} из {plano_summary['total_expected']}")
@@ -296,7 +321,7 @@ def main():
             "missing": "✗ отсутствует",
             "extra": "✗ лишний товар",
         }
-        for d in diffs:
+        for d in plano_diffs:
             print(f"\nПолка {d.shelf_number}:")
             for p in d.positions:
                 label = status_labels[p["status"]]
@@ -318,7 +343,7 @@ def main():
                     "actual": d.actual,
                     "positions": d.positions,
                 }
-                for d in diffs
+                for d in plano_diffs
             ],
         }
 
