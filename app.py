@@ -8,7 +8,7 @@ from brand_classifier import classify_brands
 from detector import auto_crop
 from layout_checker import check_layout, group_into_rows
 from main import DEFAULT_BRANDS, _detect_all_rows, labels_by_row
-from planogram import compare_to_planogram, summarize as summarize_planogram
+from planogram import compare_to_planogram, violations_as_messages, summarize as summarize_planogram
 from report import build_layout_report
 from visualizer import draw_result
 
@@ -257,7 +257,19 @@ def main():
         return
 
     image_area = cropped.shape[0] * cropped.shape[1]
-    report = build_layout_report(image_area, boxes, labels, violations)
+
+    # Если задана планограмма — считаем сравнение ЗАРАНЕЕ, чтобы найденные
+    # несоответствия ("не тот товар", "отсутствует", "лишний") сразу
+    # вошли в общий список критических нарушений и в текстовое резюме
+    # отчёта, а не остались отдельным списком в стороне.
+    plano_diffs = None
+    plano_messages = []
+    if has_planogram:
+        actual_rows = labels_by_row(boxes, labels)
+        plano_diffs = compare_to_planogram(actual_rows, planogram)
+        plano_messages = violations_as_messages(plano_diffs)
+
+    report = build_layout_report(image_area, boxes, labels, violations, extra_violations=plano_messages)
 
     st.divider()
     st.header("📋 Отчёт о выкладке")
@@ -291,13 +303,11 @@ def main():
         for m in matches:
             st.write(f"- {m.brand}: {m.confidence:.0%}")
 
-    if has_planogram:
+    if plano_diffs is not None:
         st.divider()
-        st.header("📐 Стоят ли товары на своих местах")
+        st.header("📐 Подробно по планограмме — стоят ли товары на своих местах")
 
-        actual_rows = labels_by_row(boxes, labels)
-        diffs = compare_to_planogram(actual_rows, planogram)
-        plano_summary = summarize_planogram(diffs)
+        plano_summary = summarize_planogram(plano_diffs)
 
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("Соответствие планограмме", f"{plano_summary['match_percent']}%")
@@ -316,7 +326,7 @@ def main():
             "extra": "лишний",
         }
 
-        for d in diffs:
+        for d in plano_diffs:
             with st.container(border=True):
                 st.write(f"**Полка {d.shelf_number}**")
                 rows = ["| Место | Статус | Должен быть | Фактически |", "|---|---|---|---|"]
