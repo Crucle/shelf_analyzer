@@ -22,7 +22,8 @@ import numpy as np
 
 from brand_classifier import classify_brands
 from detector import BBox, auto_crop, detect_products
-from layout_checker import check_layout
+from layout_checker import check_layout, group_into_rows
+from planogram import compare_to_planogram, load_planogram, summarize as summarize_planogram
 from report import build_layout_report
 from visualizer import draw_result
 
@@ -220,6 +221,28 @@ def _detect_all_rows(image, rows: int) -> list[BBox]:
     return all_boxes
 
 
+def labels_by_row(boxes: list[BBox], labels: list[str]) -> list:
+    """
+    Превращает плоский список найденных товаров (boxes + labels) в
+    список списков брендов по полкам — сверху вниз, внутри полки слева
+    направо. Нужен для сравнения с планограммой (см. planogram.py),
+    которая описывает выкладку именно в таком виде.
+
+    Если рамка представляет собой группу из нескольких вплотную стоящих
+    товаров одного бренда (см. BBox.count в detector.py), её метка
+    повторяется в списке count раз — планограмма описывает отдельные
+    физические позиции, а не найденные на фото рамки.
+    """
+    rows_idx = group_into_rows(boxes)
+    result = []
+    for row in rows_idx:
+        row_labels = []
+        for idx in row:
+            row_labels.extend([labels[idx]] * max(boxes[idx].count, 1))
+        result.append(row_labels)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Анализатор корректности выкладки товаров")
     parser.add_argument("image", help="Путь к фото прилавка")
@@ -279,6 +302,18 @@ def main():
             "Например: --references ./examples"
         ),
     )
+    parser.add_argument(
+        "--planogram",
+        default=None,
+        help=(
+            "Путь к JSON-файлу с эталонной планограммой — список списков "
+            "брендов, один список на полку сверху вниз, например: "
+            '[["Coca-Cola","Coca-Cola","Sprite"],["Fanta","BonAqua"]]. '
+            "Если указан, программа дополнительно сравнит фактическую "
+            "выкладку с планограммой и найдёт отсутствующие, лишние "
+            "товары и нарушения порядка (см. planogram.py)."
+        ),
+    )
     args = parser.parse_args()
 
     crop = None
@@ -331,6 +366,48 @@ def main():
         print("КРИТИЧЕСКИЕ НАРУШЕНИЯ:")
         for v in report["critical_violations"]:
             print(f"  — {v}")
+
+    if args.planogram:
+        planogram = load_planogram(args.planogram)
+        actual_rows = labels_by_row(boxes, labels)
+        diffs = compare_to_planogram(actual_rows, planogram)
+        plano_summary = summarize_planogram(diffs)
+
+        print()
+        print("=" * 60)
+        print("СРАВНЕНИЕ С ПЛАНОГРАММОЙ")
+        print("=" * 60)
+        print(f"Соответствие планограмме: {plano_summary['match_percent']}%")
+        print(f"Отсутствует товаров:      {plano_summary['total_missing']}")
+        print(f"Лишних товаров:           {plano_summary['total_extra']}")
+        print(f"Полок с неверным порядком: {plano_summary['shelves_with_order_issues']}")
+        for d in diffs:
+            print(f"\nПолка {d.shelf_number}:")
+            print(f"  Ожидалось: {d.expected}")
+            print(f"  Найдено:   {d.actual}")
+            if d.missing:
+                print(f"  ⚠ Отсутствуют: {d.missing}")
+            if d.extra:
+                print(f"  ⚠ Лишние: {d.extra}")
+            if not d.order_correct and not d.missing and not d.extra:
+                print("  ⚠ Неправильный порядок расположения")
+            if not d.missing and not d.extra and d.order_correct:
+                print("  ✓ Соответствует планограмме")
+
+        report["planogram_comparison"] = {
+            **plano_summary,
+            "shelves": [
+                {
+                    "shelf_number": d.shelf_number,
+                    "expected": d.expected,
+                    "actual": d.actual,
+                    "missing": d.missing,
+                    "extra": d.extra,
+                    "order_correct": d.order_correct,
+                }
+                for d in diffs
+            ],
+        }
 
     print()
     print(json.dumps(report, ensure_ascii=False, indent=2))
