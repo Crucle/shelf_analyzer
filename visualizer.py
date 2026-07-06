@@ -1,4 +1,6 @@
+import cv2
 import numpy as np
+
 from detector import BBox
 
 _PALETTE = [
