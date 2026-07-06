@@ -1,16 +1,16 @@
+import difflib
 import json
-from collections import Counter
 from dataclasses import dataclass, field
 
 
 @dataclass
 class ShelfDiff:
-    shelf_number: int          # номер полки, считая с 1 (сверху)
-    expected: list             # ожидаемая последовательность брендов
-    actual: list                # фактически найденная последовательность
-    missing: list = field(default_factory=list)   # чего не хватает
-    extra: list = field(default_factory=list)      # что лишнее
-    order_correct: bool = True  # совпадает ли порядок ОБЩИХ товаров
+    shelf_number: int           
+    expected: list              
+    actual: list                
+    positions: list = field(default_factory=list)  
+    missing: list = field(default_factory=list)    
+    extra: list = field(default_factory=list)       
 
 
 def load_planogram(path: str) -> list:
@@ -23,27 +23,38 @@ def save_planogram(planogram: list, path: str) -> None:
         json.dump(planogram, f, ensure_ascii=False, indent=2)
 
 
-def _diff_counts(expected: list, actual: list) -> tuple[list, list]:
-    exp_counter = Counter(expected)
-    act_counter = Counter(actual)
-    missing = list((exp_counter - act_counter).elements())
-    extra = list((act_counter - exp_counter).elements())
-    return missing, extra
-
-
-def _filter_to_common(seq: list, common: Counter) -> list:
-    remaining = Counter(common)
+def _positional_diff(expected: list, actual: list) -> list:
+    sm = difflib.SequenceMatcher(None, expected, actual, autojunk=False)
     result = []
-    for item in seq:
-        if remaining.get(item, 0) > 0:
-            result.append(item)
-            remaining[item] -= 1
+    position = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                position += 1
+                result.append(
+                    {"position": position, "status": "correct", "expected": expected[i1 + k], "actual": actual[j1 + k]}
+                )
+        elif tag == "replace":
+            n = max(i2 - i1, j2 - j1)
+            for k in range(n):
+                position += 1
+                exp = expected[i1 + k] if k < (i2 - i1) else None
+                act = actual[j1 + k] if k < (j2 - j1) else None
+                if exp is None:
+                    result.append({"position": position, "status": "extra", "expected": None, "actual": act})
+                elif act is None:
+                    result.append({"position": position, "status": "missing", "expected": exp, "actual": None})
+                else:
+                    result.append({"position": position, "status": "wrong_item", "expected": exp, "actual": act})
+        elif tag == "delete":
+            for k in range(i2 - i1):
+                position += 1
+                result.append({"position": position, "status": "missing", "expected": expected[i1 + k], "actual": None})
+        elif tag == "insert":
+            for k in range(j2 - j1):
+                position += 1
+                result.append({"position": position, "status": "extra", "expected": None, "actual": actual[j1 + k]})
     return result
-
-
-def _check_order(expected: list, actual: list) -> bool:
-    common = Counter(expected) & Counter(actual)
-    return _filter_to_common(expected, common) == _filter_to_common(actual, common)
 
 
 def compare_to_planogram(actual_rows: list, planogram: list) -> list:
@@ -52,35 +63,39 @@ def compare_to_planogram(actual_rows: list, planogram: list) -> list:
     for i in range(num_shelves):
         expected = planogram[i] if i < len(planogram) else []
         actual = actual_rows[i] if i < len(actual_rows) else []
-        missing, extra = _diff_counts(expected, actual)
-        order_correct = _check_order(expected, actual)
+        positions = _positional_diff(expected, actual)
+        missing = [p["expected"] for p in positions if p["status"] == "missing"]
+        extra = [p["actual"] for p in positions if p["status"] == "extra"]
         diffs.append(
             ShelfDiff(
                 shelf_number=i + 1,
                 expected=expected,
                 actual=actual,
+                positions=positions,
                 missing=missing,
                 extra=extra,
-                order_correct=order_correct,
             )
         )
     return diffs
 
 
 def summarize(diffs: list) -> dict:
+    all_positions = [p for d in diffs for p in d.positions]
     total_expected = sum(len(d.expected) for d in diffs)
-    total_missing = sum(len(d.missing) for d in diffs)
-    total_extra = sum(len(d.extra) for d in diffs)
-    shelves_with_order_issues = sum(1 for d in diffs if not d.order_correct and not d.missing and not d.extra)
 
-    matched = total_expected - total_missing
-    match_percent = round(100 * matched / total_expected) if total_expected else 100
+    correct = sum(1 for p in all_positions if p["status"] == "correct")
+    wrong_item = sum(1 for p in all_positions if p["status"] == "wrong_item")
+    total_missing = sum(1 for p in all_positions if p["status"] == "missing")
+    total_extra = sum(1 for p in all_positions if p["status"] == "extra")
+
+    match_percent = round(100 * correct / total_expected) if total_expected else 100
 
     return {
         "match_percent": match_percent,
         "total_expected": total_expected,
+        "correct_positions": correct,
+        "wrong_item_positions": wrong_item,
         "total_missing": total_missing,
         "total_extra": total_extra,
-        "shelves_with_order_issues": shelves_with_order_issues,
-        "is_fully_correct": total_missing == 0 and total_extra == 0 and shelves_with_order_issues == 0,
+        "is_fully_correct": wrong_item == 0 and total_missing == 0 and total_extra == 0,
     }
