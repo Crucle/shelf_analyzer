@@ -1,16 +1,3 @@
-"""
-Анализатор прилавков — веб-версия на Streamlit.
-
-Локальный запуск:
-    streamlit run app.py
-
-Деплой на Streamlit Community Cloud: см. README.md, раздел
-"Публикация на Streamlit Community Cloud".
-
-Распознавание бренда товара использует мультимодальную модель CLIP
-(см. brand_classifier.py) — при первом запуске модель скачивается из
-интернета (~600 МБ вместе с зависимостями), дальше работает офлайн.
-"""
 import json
 
 import cv2
@@ -29,7 +16,6 @@ st.set_page_config(page_title="Анализатор прилавков", page_ic
 
 
 def load_image(uploaded_file) -> np.ndarray:
-    """Декодирует загруженный в браузере файл в изображение OpenCV (BGR)."""
     data = np.frombuffer(uploaded_file.read(), dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
@@ -40,11 +26,6 @@ def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
 
 @st.cache_resource(show_spinner="Загружаю мультимодальную модель CLIP (один раз)...")
 def _warmup_model():
-    """
-    Модель CLIP грузится с диска/интернета один раз за время жизни
-    приложения (st.cache_resource) — иначе она загружалась бы заново на
-    каждый клик "Анализировать", что было бы очень медленно.
-    """
     from brand_classifier import _get_model
 
     _get_model()
@@ -72,7 +53,6 @@ def main():
     if image is None:
         st.error("Не удалось открыть изображение. Попробуйте другой файл.")
         return
-
     img_h, img_w = image.shape[:2]
 
     # Автообрезка (см. detector.auto_crop) считается один раз для
@@ -150,7 +130,6 @@ def main():
                 "но малоуверенного варианта."
             ),
         )
-
         st.subheader("Эталонные фото-примеры (по желанию)")
         st.caption(
             "Если модель путает похожие товары (например, две прозрачные "
@@ -329,10 +308,8 @@ def main():
         p2.metric("Отсутствует товаров", plano_summary["total_missing"])
         p3.metric("Лишних товаров", plano_summary["total_extra"])
         p4.metric("Полок с неверным порядком", plano_summary["shelves_with_order_issues"])
-
         if plano_summary["is_fully_correct"]:
             st.success("Выкладка полностью соответствует планограмме.")
-
         for d in diffs:
             with st.container(border=True):
                 st.write(f"**Полка {d.shelf_number}**")
