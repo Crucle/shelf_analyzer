@@ -1,8 +1,4 @@
-"""Отрисовка результатов: рамки товаров (цвет = бренд, подписан текстом),
-нарушения дополнительно обводятся красным."""
-import cv2
 import numpy as np
-
 from detector import BBox
 
 _PALETTE = [
@@ -18,12 +14,6 @@ _PALETTE = [
 
 
 def _color_for_label(label: str) -> tuple:
-    """
-    Детерминированно назначает цвет по строковой метке (названию бренда):
-    один и тот же бренд всегда получает один и тот же цвет в пределах
-    одного запуска программы. Обычный список/словарь тут не подходит,
-    т.к. цвет должен не зависеть от порядка появления брендов на фото.
-    """
     idx = hash(label) % len(_PALETTE)
     return _PALETTE[idx]
 
@@ -38,9 +28,6 @@ def draw_result(
     for box, label in zip(boxes, labels):
         color = _color_for_label(label)
         cv2.rectangle(out, (box.x, box.y), (box.x + box.w, box.y + box.h), color, 2)
-        # Если рамка — это группа из нескольких вплотную стоящих товаров
-        # (см. BBox.count в detector.py), показываем оценку количества
-        # прямо на подписи, чтобы не выдавать её молча за один товар.
         text = f"{label} ×{box.count}" if box.count > 1 else str(label)
         cv2.putText(
             out,
