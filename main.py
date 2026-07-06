@@ -10,7 +10,6 @@ from layout_checker import check_layout, group_into_rows
 from planogram import compare_to_planogram, load_planogram, summarize as summarize_planogram
 from report import build_layout_report
 from visualizer import draw_result
-
 DEFAULT_BRANDS = {
     "Coca-Cola": [
         "a photo of a dark cola soft drink bottle with a red logo and red bottle cap",
@@ -46,7 +45,6 @@ def _imread_unicode(path: str):
 
 
 def _imwrite_unicode(path: str, image: np.ndarray) -> bool:
-    """Аналогично _imread_unicode, но для сохранения файла."""
     ext = "." + path.rsplit(".", 1)[-1] if "." in path else ".jpg"
     ok, buf = cv2.imencode(ext, image)
     if not ok:
@@ -89,7 +87,6 @@ def analyze_image(
     min_confidence: float = 0.0,
     reference_images: dict = None,
 ):
-   
     brands = brands or DEFAULT_BRANDS
 
     boxes = _detect_all_rows(image, rows)
@@ -128,7 +125,6 @@ def analyze(
 
 
 def _detect_all_rows(image, rows: int) -> list[BBox]:
-    
     h_img = image.shape[0]
     row_height = h_img // rows
 
@@ -286,24 +282,32 @@ def main():
 
         print()
         print("=" * 60)
-        print("СРАВНЕНИЕ С ПЛАНОГРАММОЙ")
+        print("СРАВНЕНИЕ С ПЛАНОГРАММОЙ — СТОЯТ ЛИ ТОВАРЫ НА СВОИХ МЕСТАХ")
         print("=" * 60)
-        print(f"Соответствие планограмме: {plano_summary['match_percent']}%")
-        print(f"Отсутствует товаров:      {plano_summary['total_missing']}")
-        print(f"Лишних товаров:           {plano_summary['total_extra']}")
-        print(f"Полок с неверным порядком: {plano_summary['shelves_with_order_issues']}")
+        print(f"Соответствие планограмме:  {plano_summary['match_percent']}%")
+        print(f"Верных позиций:            {plano_summary['correct_positions']} из {plano_summary['total_expected']}")
+        print(f"Товаров не на своём месте: {plano_summary['wrong_item_positions']}")
+        print(f"Отсутствует товаров:       {plano_summary['total_missing']}")
+        print(f"Лишних товаров:            {plano_summary['total_extra']}")
+
+        status_labels = {
+            "correct": "✓ на месте",
+            "wrong_item": "✗ не тот товар",
+            "missing": "✗ отсутствует",
+            "extra": "✗ лишний товар",
+        }
         for d in diffs:
             print(f"\nПолка {d.shelf_number}:")
-            print(f"  Ожидалось: {d.expected}")
-            print(f"  Найдено:   {d.actual}")
-            if d.missing:
-                print(f"  ⚠ Отсутствуют: {d.missing}")
-            if d.extra:
-                print(f"  ⚠ Лишние: {d.extra}")
-            if not d.order_correct and not d.missing and not d.extra:
-                print("  ⚠ Неправильный порядок расположения")
-            if not d.missing and not d.extra and d.order_correct:
-                print("  ✓ Соответствует планограмме")
+            for p in d.positions:
+                label = status_labels[p["status"]]
+                if p["status"] == "correct":
+                    print(f"  Место {p['position']}: {label} — {p['expected']}")
+                elif p["status"] == "wrong_item":
+                    print(f"  Место {p['position']}: {label} — должен быть {p['expected']}, стоит {p['actual']}")
+                elif p["status"] == "missing":
+                    print(f"  Место {p['position']}: {label} — должен быть {p['expected']}")
+                elif p["status"] == "extra":
+                    print(f"  Место {p['position']}: {label} — стоит {p['actual']}, по плану тут ничего нет")
 
         report["planogram_comparison"] = {
             **plano_summary,
@@ -312,9 +316,7 @@ def main():
                     "shelf_number": d.shelf_number,
                     "expected": d.expected,
                     "actual": d.actual,
-                    "missing": d.missing,
-                    "extra": d.extra,
-                    "order_correct": d.order_correct,
+                    "positions": d.positions,
                 }
                 for d in diffs
             ],
