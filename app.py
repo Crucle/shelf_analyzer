@@ -1,345 +1,278 @@
 """
-Анализатор прилавков — точка входа.
+Анализатор прилавков — веб-версия на Streamlit.
 
-Использование:
-    python main.py путь_к_фото.jpg [--out result.jpg] [--brands "Coca-Cola,Sprite,Fanta"]
+Локальный запуск:
+    streamlit run app.py
 
-Пайплайн:
-    фото -> детекция товаров -> распознавание бренда (мультимодальная
-    модель CLIP) -> проверка расположения -> JSON-отчёт + фото с разметкой
+Деплой на Streamlit Community Cloud: см. README.md, раздел
+"Публикация на Streamlit Community Cloud".
 
-Раньше вместо распознавания бренда использовалась кластеризация по
-цвету/форме без обучения (см. clustering.py, features.py) — она до сих
-пор в проекте и рабочая, но по заданию практики нужна именно
-мультимодальная модель ИИ, поэтому основной пайплайн теперь использует
-brand_classifier.py (CLIP).
+Распознавание бренда товара использует мультимодальную модель CLIP
+(см. brand_classifier.py) — при первом запуске модель скачивается из
+интернета (~600 МБ вместе с зависимостями), дальше работает офлайн.
 """
-import argparse
-import json
-
 import cv2
 import numpy as np
+import streamlit as st
 
 from brand_classifier import classify_brands
-from detector import BBox, auto_crop, detect_products
+from detector import auto_crop
 from layout_checker import check_layout
+from main import DEFAULT_BRANDS, _detect_all_rows
 from report import build_layout_report
 from visualizer import draw_result
 
-# Бренды для нашего тестового фото прилавка с напитками — с описанием
-# отличительных признаков (цвет крышки/этикетки, логотип). Это заметно
-# точнее, чем просто список названий: товары с похожим цветом (например,
-# две прозрачные бутылки — Schweppes и BonAqua) CLIP различает по одному
-# общему шаблону фразы гораздо хуже, чем по конкретному описанию внешнего
-# вида. Можно указать несколько описаний на бренд — они усредняются
-# ("prompt ensembling", см. brand_classifier.py). Поменяйте под свои
-# товары — это единственное, что нужно изменить, чтобы применить
-# программу к другой категории.
-DEFAULT_BRANDS = {
-    "Coca-Cola": [
-        "a photo of a dark cola soft drink bottle with a red logo and red bottle cap",
-        "a photo of a Coca-Cola soda bottle",
-    ],
-    "Sprite": [
-        "a photo of a clear bottle of bright green lemon-lime soda with a green bottle cap",
-        "a photo of a Sprite soda bottle",
-    ],
-    "Fanta": [
-        "a photo of an orange soda bottle with an orange label and orange bottle cap",
-        "a photo of a Fanta soda bottle",
-    ],
-    "Schweppes": [
-        "a photo of a pale golden tonic water bottle with a dark rectangular label and yellow bottle cap",
-        "a photo of a Schweppes bottle",
-    ],
-    "BonAqua": [
-        "a photo of a clear still mineral water bottle with a blue label and blue bottle cap",
-        "a photo of a BonAqua water bottle",
-    ],
-}
+st.set_page_config(page_title="Анализатор прилавков", page_icon="🛒", layout="wide")
 
 
-def _imread_unicode(path: str):
-    """
-    Читает изображение по пути, который может содержать кириллицу или
-    другие не-ASCII символы. Обычный cv2.imread на Windows иногда не
-    может открыть такие пути — обходим через numpy + imdecode.
-    """
-    try:
-        data = np.fromfile(path, dtype=np.uint8)
-    except FileNotFoundError:
-        return None
-    if data.size == 0:
-        return None
+def load_image(uploaded_file) -> np.ndarray:
+    """Декодирует загруженный в браузере файл в изображение OpenCV (BGR)."""
+    data = np.frombuffer(uploaded_file.read(), dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def _imwrite_unicode(path: str, image: np.ndarray) -> bool:
-    """Аналогично _imread_unicode, но для сохранения файла."""
-    ext = "." + path.rsplit(".", 1)[-1] if "." in path else ".jpg"
-    ok, buf = cv2.imencode(ext, image)
-    if not ok:
-        return False
-    buf.tofile(path)
+def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+@st.cache_resource(show_spinner="Загружаю мультимодальную модель CLIP (один раз)...")
+def _warmup_model():
+    """
+    Модель CLIP грузится с диска/интернета один раз за время жизни
+    приложения (st.cache_resource) — иначе она загружалась бы заново на
+    каждый клик "Анализировать", что было бы очень медленно.
+    """
+    from brand_classifier import _get_model
+
+    _get_model()
     return True
 
 
-def load_reference_images(folder: str, brand_names: list[str] = None) -> dict:
-    """
-    Загружает эталонные фото-примеры для few-shot распознавания брендов
-    (см. brand_classifier.classify_brands, параметр reference_images).
-
-    Ожидаемая структура папки — по подпапке на бренд:
-        folder/
-          Coca-Cola/
-            фото1.jpg
-            фото2.jpg
-          Schweppes/
-            фото1.jpg
-          BonAqua/
-            фото1.jpg
-
-    Название подпапки должно точно совпадать с названием бренда в
-    списке (см. DEFAULT_BRANDS или --brands). Подпапки для брендов, у
-    которых нет примеров, можно не создавать — для них просто не будет
-    фото-эталонов, останутся только текстовые описания.
-
-    brand_names — если передан, используются только подпапки с этими
-    именами (остальные подпапки в folder игнорируются); если не передан,
-    берутся все найденные подпапки.
-
-    Возвращает словарь {название_бренда: [numpy-изображение, ...]},
-    готовый для передачи в classify_brands(reference_images=...).
-    """
-    import os
-
-    result: dict = {}
-    if not os.path.isdir(folder):
-        raise FileNotFoundError(f"Папка с эталонными фото не найдена: {folder}")
-
-    for entry in sorted(os.listdir(folder)):
-        brand_dir = os.path.join(folder, entry)
-        if not os.path.isdir(brand_dir):
-            continue
-        if brand_names is not None and entry not in brand_names:
-            continue
-
-        images = []
-        for fname in sorted(os.listdir(brand_dir)):
-            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            img = _imread_unicode(os.path.join(brand_dir, fname))
-            if img is not None:
-                images.append(img)
-        if images:
-            result[entry] = images
-
-    return result
-
-
-def analyze_image(
-    image: np.ndarray,
-    brands: list[str] = None,
-    rows: int = 1,
-    min_confidence: float = 0.0,
-    reference_images: dict = None,
-):
-    """
-    Основной пайплайн анализа для уже загруженного в память изображения
-    (numpy-массив BGR). Вынесено отдельно от analyze(), чтобы этим же кодом
-    могли пользоваться и CLI (main.py), и веб-версия (app.py на Streamlit),
-    где фото приходит из браузера, а не с диска.
-    """
-    brands = brands or DEFAULT_BRANDS
-
-    boxes = _detect_all_rows(image, rows)
-    if not boxes:
-        return image, [], [], [], []
-
-    matches = classify_brands(
-        image, boxes, brands, reference_images=reference_images, min_confidence=min_confidence
-    )
-    labels = [m.brand for m in matches]
-    violations = check_layout(boxes, labels)
-
-    return image, boxes, labels, violations, matches
-
-
-def analyze(
-    image_path: str,
-    brands: list[str] = None,
-    crop=None,
-    rows: int = 1,
-    reference_images: dict = None,
-    use_auto_crop: bool = True,
-):
-    """CLI-обёртка: читает фото с диска (см. _imread_unicode) и обрезает при необходимости."""
-    image = _imread_unicode(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Не удалось открыть изображение: {image_path}")
-
-    if crop is not None:
-        x1, y1, x2, y2 = crop
-        image = image[y1:y2, x1:x2]
-    elif use_auto_crop:
-        # Пользователь не указал область вручную — пробуем сами найти
-        # прилавок по резкости (см. detector.auto_crop) и убрать
-        # размытый фон (соседние стеллажи). Если чёткой границы не
-        # нашлось, auto_crop честно вернёт границы всего изображения —
-        # тогда просто ничего не обрезаем.
-        x1, y1, x2, y2 = auto_crop(image)
-        image = image[y1:y2, x1:x2]
-
-    return analyze_image(image, brands, rows, reference_images=reference_images)
-
-
-def _detect_all_rows(image, rows: int) -> list[BBox]:
-    """
-    Детектор (см. detector.py) устроен так, что надёжно работает только
-    с одной полкой за раз — он анализирует, где на всю высоту переданного
-    кадра есть промежутки между товарами, а на фото с несколькими полками
-    сразу это не работает (промежуток на одной полке может быть занят
-    товаром на другой).
-
-    Поэтому для фото всего стеллажа делим кадр на `rows` равных
-    горизонтальных полос (по числу физических полок на фото, которое
-    сообщает пользователь) и прогоняем детекцию на каждой полосе отдельно,
-    а затем возвращаем все найденные рамки в координатах исходного кадра.
-    """
-    h_img = image.shape[0]
-    row_height = h_img // rows
-
-    all_boxes: list[BBox] = []
-    for i in range(rows):
-        y1 = i * row_height
-        y2 = h_img if i == rows - 1 else (i + 1) * row_height
-        band = image[y1:y2]
-        band_boxes = detect_products(band)
-        for b in band_boxes:
-            all_boxes.append(BBox(b.x, b.y + y1, b.w, b.h, count=b.count))
-    return all_boxes
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Анализатор корректности выкладки товаров")
-    parser.add_argument("image", help="Путь к фото прилавка")
-    parser.add_argument("--out", default="result.jpg", help="Куда сохранить размеченное фото")
-    parser.add_argument(
-        "--brands",
-        default=None,
-        help=(
-            "Список брендов через запятую, которые нужно искать на фото, "
-            'например --brands "Coca-Cola,Sprite,Fanta". Если не указать — '
-            "используется список по умолчанию (напитки из тестового фото)."
-        ),
+    st.title("🛒 Анализатор прилавков")
+    st.caption(
+        "Проверка корректности выкладки товаров по фото: находит отдельные "
+        "товары, распознаёт бренд с помощью мультимодальной модели CLIP и "
+        "определяет, стоят ли одинаковые товары единым блоком, или разбиты "
+        "другими товарами."
     )
-    parser.add_argument(
-        "--crop",
-        default=None,
-        help=(
-            "Обрезать фото перед анализом до области x1,y1,x2,y2 "
-            "(в пикселях). Полезно, если в кадр попал соседний стеллаж "
-            "или лишний фон, мешающий детекции — например: "
-            "--crop 440,0,1040,768. Если не указать, программа попробует "
-            "обрезать фон автоматически (см. --no-auto-crop)."
-        ),
-    )
-    parser.add_argument(
-        "--no-auto-crop",
-        action="store_true",
-        help=(
-            "Отключить автоматическую обрезку фона (по умолчанию, если "
-            "--crop не указан вручную, программа сама пытается найти "
-            "область прилавка по резкости изображения — см. README, "
-            "раздел про автообрезку). Полезно отключить, если "
-            "автоматическая обрезка ошибается на вашем конкретном фото."
-        ),
-    )
-    parser.add_argument(
-        "--rows",
-        type=int,
-        default=1,
-        help=(
-            "Сколько физических полок на фото (по высоте). По умолчанию 1 "
-            "(фото одной полки). Если на фото весь стеллаж — укажите "
-            "фактическое число полок, например --rows 3: кадр будет "
-            "поделён на столько же равных горизонтальных полос, и на "
-            "каждой детекция запустится отдельно. Это единственный "
-            "параметр, который пока нельзя определить автоматически "
-            "надёжно (см. README) — приходится указывать вручную."
-        ),
-    )
-    parser.add_argument(
-        "--references",
-        default=None,
-        help=(
-            "Папка с эталонными фото-примерами брендов для более точного "
-            "распознавания похожих товаров (few-shot). Структура — по "
-            "подпапке на бренд, см. main.py -> load_reference_images(). "
-            "Например: --references ./examples"
-        ),
-    )
-    args = parser.parse_args()
 
-    crop = None
-    if args.crop:
-        x1, y1, x2, y2 = (int(v) for v in args.crop.split(","))
-        crop = (x1, y1, x2, y2)
+    uploaded_file = st.file_uploader(
+        "Загрузите фото прилавка", type=["jpg", "jpeg", "png"]
+    )
 
-    brands = [b.strip() for b in args.brands.split(",")] if args.brands else None
+    if uploaded_file is None:
+        st.info("Загрузите фото, чтобы начать анализ.")
+        return
 
-    reference_images = None
-    if args.references:
-        brand_names = list(brands) if brands else list(DEFAULT_BRANDS.keys())
-        reference_images = load_reference_images(args.references, brand_names)
-        if reference_images:
-            print(
-                "Загружены эталонные фото: "
-                + ", ".join(f"{k} ({len(v)} шт.)" for k, v in reference_images.items())
+    image = load_image(uploaded_file)
+    if image is None:
+        st.error("Не удалось открыть изображение. Попробуйте другой файл.")
+        return
+
+    img_h, img_w = image.shape[:2]
+
+    # Автообрезка (см. detector.auto_crop) считается один раз для
+    # каждого нового загруженного фото и служит стартовым значением
+    # ползунков — дальше пользователь может подправить их вручную, если
+    # автоматика ошиблась. Пересчитываем только когда меняется само фото
+    # (а не при каждом перерисовывании страницы).
+    file_key = f"{uploaded_file.name}:{uploaded_file.size}"
+    if st.session_state.get("_crop_file_key") != file_key:
+        st.session_state["_crop_file_key"] = file_key
+        ax1, ay1, ax2, ay2 = auto_crop(image)
+        st.session_state["_crop_x"] = (ax1, ax2)
+        st.session_state["_crop_y"] = (ay1, ay2)
+
+    with st.sidebar:
+        st.header("Настройки")
+
+        st.subheader("Обрезка кадра")
+        st.caption(
+            "Ползунки уже настроены автоматически (по резкости — сам "
+            "прилавок обычно в фокусе, а фон вокруг размыт). Если "
+            "автообрезка ошиблась — поправьте вручную; кнопка ниже "
+            "сбрасывает на всё фото целиком."
+        )
+        if st.button("Сбросить на всё фото"):
+            st.session_state["_crop_x"] = (0, img_w)
+            st.session_state["_crop_y"] = (0, img_h)
+        x1, x2 = st.slider("Диапазон по X", 0, img_w, key="_crop_x")
+        y1, y2 = st.slider("Диапазон по Y", 0, img_h, key="_crop_y")
+
+        st.subheader("Полки")
+        rows = st.number_input(
+            "Сколько физических полок на фото (по высоте)",
+            min_value=1,
+            max_value=10,
+            value=1,
+            help=(
+                "Детектор надёжно работает с одной полкой за раз. Если на "
+                "фото весь стеллаж — укажите реальное число полок, кадр "
+                "поделится на столько же равных горизонтальных полос."
+            ),
+        )
+
+        st.subheader("Бренды для распознавания")
+        brands_text = st.text_area(
+            "Список брендов через запятую",
+            value=", ".join(DEFAULT_BRANDS.keys()),
+            help=(
+                "CLIP выберет для каждого товара наиболее подходящий бренд "
+                "из этого списка. Впишите те бренды, которые реально есть "
+                "на вашем фото — чем точнее список, тем точнее результат. "
+                "Если оставить список по умолчанию без изменений, "
+                "используются встроенные подробные описания каждого бренда "
+                "(цвет крышки, этикетки и т.п.) — они точнее, чем просто "
+                "название, особенно для похожих по цвету товаров."
+            ),
+        )
+        brand_names_from_text = [b.strip() for b in brands_text.split(",") if b.strip()]
+        if brand_names_from_text == list(DEFAULT_BRANDS.keys()):
+            # Список не менялся — используем встроенные подробные описания
+            # (с несколькими фразами на бренд), а не просто голые названия.
+            brands = DEFAULT_BRANDS
+        else:
+            brands = brand_names_from_text
+
+        min_confidence = st.slider(
+            "Минимальная уверенность модели",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.3,
+            step=0.05,
+            help=(
+                "Если уверенность модели в лучшем бренде ниже этого порога, "
+                'товар помечается как "не определено" вместо навязанного, '
+                "но малоуверенного варианта."
+            ),
+        )
+
+        st.subheader("Эталонные фото-примеры (по желанию)")
+        st.caption(
+            "Если модель путает похожие товары (например, две прозрачные "
+            "бутылки воды разных марок) — покажите ей несколько реальных "
+            'фото каждого бренда. Назовите файлы вида "Schweppes_1.jpg" — '
+            "часть имени до первого подчёркивания должна точно совпадать "
+            "с названием бренда из списка выше."
+        )
+        ref_files = st.file_uploader(
+            "Эталонные фото (можно выбрать сразу несколько)",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+        )
+
+        reference_images = {}
+        if ref_files:
+            brand_names_current = list(brands.keys()) if isinstance(brands, dict) else brands
+            unmatched = []
+            for f in ref_files:
+                brand_guess = f.name.rsplit(".", 1)[0].split("_")[0].strip()
+                matched = next(
+                    (b for b in brand_names_current if b.lower() == brand_guess.lower()), None
+                )
+                if matched:
+                    reference_images.setdefault(matched, []).append(load_image(f))
+                else:
+                    unmatched.append(f.name)
+            if unmatched:
+                st.warning(
+                    f"Не удалось определить бренд по имени файла: {', '.join(unmatched)}. "
+                    'Переименуйте как "Бренд_1.jpg".'
+                )
+            if reference_images:
+                st.success(
+                    "Загружены эталоны: "
+                    + ", ".join(f"{k} ({len(v)})" for k, v in reference_images.items())
+                )
+
+        run = st.button("Анализировать", type="primary", use_container_width=True)
+
+    cropped = image[y1:y2, x1:x2]
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.subheader("Исходное фото (после обрезки)")
+        st.image(bgr_to_rgb(cropped), use_container_width=True)
+
+    if not run:
+        with col_right:
+            st.info("Настройте параметры слева и нажмите «Анализировать».")
+        return
+
+    if not brands:
+        st.error("Список брендов пуст — впишите хотя бы один бренд слева.")
+        return
+
+    _warmup_model()
+
+    with st.spinner("Анализирую..."):
+        boxes = _detect_all_rows(cropped, rows)
+        if not boxes:
+            labels, violations, matches = [], [], []
+        else:
+            matches = classify_brands(
+                cropped,
+                boxes,
+                brands,
+                reference_images=reference_images or None,
+                min_confidence=min_confidence,
+            )
+            labels = [m.brand for m in matches]
+            violations = check_layout(boxes, labels)
+
+    with col_right:
+        st.subheader("Результат")
+        if not boxes:
+            st.warning(
+                "Товары не найдены. Попробуйте изменить область обрезки — "
+                "возможно, в кадре мало контраста между товарами и фоном."
             )
         else:
-            print(f"⚠ В папке {args.references} не найдено подходящих эталонных фото.")
+            violation_labels = {v.label for v in violations}
+            result_img = draw_result(cropped, boxes, labels, violation_labels)
+            st.image(bgr_to_rgb(result_img), use_container_width=True)
 
-    if crop is None and not args.no_auto_crop:
-        print("Область обрезки не указана — пробую найти прилавок автоматически...")
+    if not boxes:
+        return
 
-    image, boxes, labels, violations, matches = analyze(
-        args.image, brands, crop, args.rows, reference_images, use_auto_crop=not args.no_auto_crop
-    )
-    image_area = image.shape[0] * image.shape[1]
+    image_area = cropped.shape[0] * cropped.shape[1]
     report = build_layout_report(image_area, boxes, labels, violations)
 
-    print("=" * 60)
-    print("ОТЧЁТ О ВЫКЛАДКЕ")
-    print("=" * 60)
-    print(f"Соответствие выкладке:   {report['compliance_percent']}%")
-    print(f"Критических нарушений:   {report['critical_violations_count']}")
-    print(f"Полок распознано:        {report['shelves_recognized']}")
-    print(f"Товаров найдено:         {report['total_products']}" + (" (оценочно)" if report["count_is_estimated"] else ""))
-    print(f"Позиций (рамок) найдено: {report['positions_detected']}")
-    print()
-    print(report["summary"])
+    st.divider()
+    st.header("📋 Отчёт о выкладке")
 
-    if report["warnings"]:
-        print()
-        print("ПРЕДУПРЕЖДЕНИЯ:")
-        for w in report["warnings"]:
-            print(f"  ⚠ {w}")
+    for w in report["warnings"]:
+        st.warning(f"⚠️ {w}")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Соответствие выкладке", f"{report['compliance_percent']}%")
+    m2.metric("Критических нарушений", report["critical_violations_count"])
+    m3.metric("Полок распознано", report["shelves_recognized"])
+    m4.metric(
+        "Товаров найдено",
+        report["total_products"],
+        delta="оценка" if report["count_is_estimated"] else "точно",
+        delta_color="off",
+    )
+
+    st.progress(report["compliance_percent"] / 100)
+
+    st.write(report["summary"])
 
     if report["critical_violations"]:
-        print()
-        print("КРИТИЧЕСКИЕ НАРУШЕНИЯ:")
+        st.subheader("Критические нарушения")
         for v in report["critical_violations"]:
-            print(f"  — {v}")
+            st.error(v)
+    else:
+        st.success("Нарушений выкладки не найдено — одинаковые товары стоят блоками.")
 
-    print()
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    with st.expander("Уверенность модели по каждому товару"):
+        for m in matches:
+            st.write(f"- {m.brand}: {m.confidence:.0%}")
 
-    if boxes:
-        violation_labels = {v.label for v in violations}
-        result_img = draw_result(image, boxes, labels, violation_labels)
-        _imwrite_unicode(args.out, result_img)
-        print(f"\nРазмеченное фото сохранено: {args.out}")
+    with st.expander("Полный отчёт (JSON)"):
+        st.json(report)
 
 
 if __name__ == "__main__":
