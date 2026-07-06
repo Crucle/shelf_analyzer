@@ -11,14 +11,17 @@
 (см. brand_classifier.py) — при первом запуске модель скачивается из
 интернета (~600 МБ вместе с зависимостями), дальше работает офлайн.
 """
+import json
+
 import cv2
 import numpy as np
 import streamlit as st
 
 from brand_classifier import classify_brands
 from detector import auto_crop
-from layout_checker import check_layout
-from main import DEFAULT_BRANDS, _detect_all_rows
+from layout_checker import check_layout, group_into_rows
+from main import DEFAULT_BRANDS, _detect_all_rows, labels_by_row
+from planogram import compare_to_planogram, summarize as summarize_planogram
 from report import build_layout_report
 from visualizer import draw_result
 
@@ -186,6 +189,48 @@ def main():
                     + ", ".join(f"{k} ({len(v)})" for k, v in reference_images.items())
                 )
 
+        st.subheader("Планограмма (по желанию)")
+        st.caption(
+            "Задайте эталонную выкладку — что должно стоять на каждой "
+            "полке слева направо. Программа сравнит фактический результат "
+            "с планограммой и найдёт отсутствующие, лишние товары и "
+            "нарушения порядка. Если оставить пустым — эта проверка "
+            "просто не выполнится, остальной анализ работает как обычно."
+        )
+
+        planogram_file = st.file_uploader(
+            "Загрузить готовую планограмму (JSON)", type=["json"], key="_planogram_upload"
+        )
+
+        planogram = None
+        if planogram_file is not None:
+            try:
+                planogram = json.load(planogram_file)
+                st.success(f"Планограмма загружена: {len(planogram)} полок.")
+            except Exception as e:
+                st.error(f"Не удалось прочитать файл планограммы: {e}")
+
+        if planogram is None:
+            st.caption("Или впишите ожидаемые бренды по полкам вручную (через запятую):")
+            planogram = []
+            for i in range(int(rows)):
+                shelf_text = st.text_input(
+                    f"Полка {i + 1}",
+                    key=f"_planogram_shelf_{i}",
+                    placeholder="Coca-Cola, Coca-Cola, Sprite, Fanta",
+                )
+                planogram.append([b.strip() for b in shelf_text.split(",") if b.strip()])
+
+        has_planogram = any(planogram)
+        if has_planogram:
+            st.download_button(
+                "Скачать эту планограмму (JSON)",
+                data=json.dumps(planogram, ensure_ascii=False, indent=2),
+                file_name="planogram.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
         run = st.button("Анализировать", type="primary", use_container_width=True)
 
     cropped = image[y1:y2, x1:x2]
@@ -270,6 +315,40 @@ def main():
     with st.expander("Уверенность модели по каждому товару"):
         for m in matches:
             st.write(f"- {m.brand}: {m.confidence:.0%}")
+
+    if has_planogram:
+        st.divider()
+        st.header("📐 Сравнение с планограммой")
+
+        actual_rows = labels_by_row(boxes, labels)
+        diffs = compare_to_planogram(actual_rows, planogram)
+        plano_summary = summarize_planogram(diffs)
+
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Соответствие планограмме", f"{plano_summary['match_percent']}%")
+        p2.metric("Отсутствует товаров", plano_summary["total_missing"])
+        p3.metric("Лишних товаров", plano_summary["total_extra"])
+        p4.metric("Полок с неверным порядком", plano_summary["shelves_with_order_issues"])
+
+        if plano_summary["is_fully_correct"]:
+            st.success("Выкладка полностью соответствует планограмме.")
+
+        for d in diffs:
+            with st.container(border=True):
+                st.write(f"**Полка {d.shelf_number}**")
+                cA, cB = st.columns(2)
+                cA.write("Ожидалось:")
+                cA.write(", ".join(d.expected) if d.expected else "—")
+                cB.write("Найдено:")
+                cB.write(", ".join(d.actual) if d.actual else "—")
+                if d.missing:
+                    st.warning(f"Отсутствуют: {', '.join(d.missing)}")
+                if d.extra:
+                    st.warning(f"Лишние: {', '.join(d.extra)}")
+                if not d.order_correct and not d.missing and not d.extra:
+                    st.warning("Неправильный порядок расположения товаров")
+                if not d.missing and not d.extra and d.order_correct:
+                    st.success("Полка соответствует планограмме")
 
     with st.expander("Полный отчёт (JSON)"):
         st.json(report)
