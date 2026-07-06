@@ -1,25 +1,8 @@
-"""
-Сборка итогового отчёта о выкладке в формате дашборда: процент
-соответствия, число критических нарушений, число распознанных полок,
-текстовое резюме и список конкретных нарушений.
-
-У нас нет эталонной планограммы (плана "что где должно стоять") — вместо
-сравнения с ней используется собственная метрика на основе фактически
-найденных нарушений (см. compliance_percent ниже). Если планограмма
-появится, эту метрику легко заменить на честное сравнение факт/план —
-интерфейс функции (набор входных данных → тот же набор полей отчёта)
-менять не придётся.
-"""
 from detector import BBox
 from layout_checker import Violation, group_into_rows
 
 
 def _compliance_percent(brands_found: list[str], violations: list[Violation]) -> int:
-    """
-    Доля брендов, у которых НЕ было найдено нарушений (стоят единым
-    блоком), от всех найденных брендов. 100% — все бренды разложены
-    правильно, 0% — у каждого найденного бренда есть хотя бы один разрыв.
-    """
     if not brands_found:
         return 100
     brands_with_violation = {v.label for v in violations}
@@ -38,18 +21,6 @@ def _compliance_comment(percent: int) -> str:
 
 
 def _find_oversized_boxes(boxes: list[BBox], image_area: int, ratio_threshold: float = 0.15) -> list[BBox]:
-    """
-    Рамка, где площадь В РАСЧЁТЕ НА ОДНУ ОЦЕНЁННУЮ ЕДИНИЦУ ТОВАРА (см.
-    BBox.count в detector.py) занимает слишком большую долю кадра, почти
-    всегда означает, что в кадр попал лишний фон (соседний стеллаж, часть
-    прохода) и детектор поймал его как один "товар". Используется, чтобы
-    предупредить пользователя — см. warnings в build_layout_report.
-
-    Считаем именно на одну единицу, а не на весь бокс целиком: блок из
-    нескольких товаров, стоящих вплотную (см. _split_by_color в
-    detector.py), законно может занимать значительную часть кадра — это
-    не признак лишнего фона.
-    """
     result = []
     for b in boxes:
         per_item_ratio = (b.area / max(b.count, 1)) / image_area if image_area else 0
@@ -64,11 +35,6 @@ def build_layout_report(
     labels: list[str],
     violations: list[Violation],
 ) -> dict:
-    """
-    Собирает итоговый отчёт. image_area нужен только для проверки на
-    "слишком большие" рамки (см. _find_oversized_boxes) — на сам расчёт
-    соответствия не влияет.
-    """
     brands_found = sorted(set(labels)) if labels else []
     shelves_recognized = len(group_into_rows(boxes))
     compliance = _compliance_percent(brands_found, violations)
