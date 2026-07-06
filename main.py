@@ -1,19 +1,3 @@
-"""
-Анализатор прилавков — точка входа.
-
-Использование:
-    python main.py путь_к_фото.jpg [--out result.jpg] [--brands "Coca-Cola,Sprite,Fanta"]
-
-Пайплайн:
-    фото -> детекция товаров -> распознавание бренда (мультимодальная
-    модель CLIP) -> проверка расположения -> JSON-отчёт + фото с разметкой
-
-Раньше вместо распознавания бренда использовалась кластеризация по
-цвету/форме без обучения (см. clustering.py, features.py) — она до сих
-пор в проекте и рабочая, но по заданию практики нужна именно
-мультимодальная модель ИИ, поэтому основной пайплайн теперь использует
-brand_classifier.py (CLIP).
-"""
 import argparse
 import json
 
@@ -27,15 +11,6 @@ from planogram import compare_to_planogram, load_planogram, summarize as summari
 from report import build_layout_report
 from visualizer import draw_result
 
-# Бренды для нашего тестового фото прилавка с напитками — с описанием
-# отличительных признаков (цвет крышки/этикетки, логотип). Это заметно
-# точнее, чем просто список названий: товары с похожим цветом (например,
-# две прозрачные бутылки — Schweppes и BonAqua) CLIP различает по одному
-# общему шаблону фразы гораздо хуже, чем по конкретному описанию внешнего
-# вида. Можно указать несколько описаний на бренд — они усредняются
-# ("prompt ensembling", см. brand_classifier.py). Поменяйте под свои
-# товары — это единственное, что нужно изменить, чтобы применить
-# программу к другой категории.
 DEFAULT_BRANDS = {
     "Coca-Cola": [
         "a photo of a dark cola soft drink bottle with a red logo and red bottle cap",
@@ -61,11 +36,6 @@ DEFAULT_BRANDS = {
 
 
 def _imread_unicode(path: str):
-    """
-    Читает изображение по пути, который может содержать кириллицу или
-    другие не-ASCII символы. Обычный cv2.imread на Windows иногда не
-    может открыть такие пути — обходим через numpy + imdecode.
-    """
     try:
         data = np.fromfile(path, dtype=np.uint8)
     except FileNotFoundError:
@@ -86,32 +56,6 @@ def _imwrite_unicode(path: str, image: np.ndarray) -> bool:
 
 
 def load_reference_images(folder: str, brand_names: list[str] = None) -> dict:
-    """
-    Загружает эталонные фото-примеры для few-shot распознавания брендов
-    (см. brand_classifier.classify_brands, параметр reference_images).
-
-    Ожидаемая структура папки — по подпапке на бренд:
-        folder/
-          Coca-Cola/
-            фото1.jpg
-            фото2.jpg
-          Schweppes/
-            фото1.jpg
-          BonAqua/
-            фото1.jpg
-
-    Название подпапки должно точно совпадать с названием бренда в
-    списке (см. DEFAULT_BRANDS или --brands). Подпапки для брендов, у
-    которых нет примеров, можно не создавать — для них просто не будет
-    фото-эталонов, останутся только текстовые описания.
-
-    brand_names — если передан, используются только подпапки с этими
-    именами (остальные подпапки в folder игнорируются); если не передан,
-    берутся все найденные подпапки.
-
-    Возвращает словарь {название_бренда: [numpy-изображение, ...]},
-    готовый для передачи в classify_brands(reference_images=...).
-    """
     import os
 
     result: dict = {}
@@ -145,12 +89,7 @@ def analyze_image(
     min_confidence: float = 0.0,
     reference_images: dict = None,
 ):
-    """
-    Основной пайплайн анализа для уже загруженного в память изображения
-    (numpy-массив BGR). Вынесено отдельно от analyze(), чтобы этим же кодом
-    могли пользоваться и CLI (main.py), и веб-версия (app.py на Streamlit),
-    где фото приходит из браузера, а не с диска.
-    """
+   
     brands = brands or DEFAULT_BRANDS
 
     boxes = _detect_all_rows(image, rows)
@@ -174,7 +113,6 @@ def analyze(
     reference_images: dict = None,
     use_auto_crop: bool = True,
 ):
-    """CLI-обёртка: читает фото с диска (см. _imread_unicode) и обрезает при необходимости."""
     image = _imread_unicode(image_path)
     if image is None:
         raise FileNotFoundError(f"Не удалось открыть изображение: {image_path}")
@@ -183,11 +121,6 @@ def analyze(
         x1, y1, x2, y2 = crop
         image = image[y1:y2, x1:x2]
     elif use_auto_crop:
-        # Пользователь не указал область вручную — пробуем сами найти
-        # прилавок по резкости (см. detector.auto_crop) и убрать
-        # размытый фон (соседние стеллажи). Если чёткой границы не
-        # нашлось, auto_crop честно вернёт границы всего изображения —
-        # тогда просто ничего не обрезаем.
         x1, y1, x2, y2 = auto_crop(image)
         image = image[y1:y2, x1:x2]
 
@@ -195,18 +128,7 @@ def analyze(
 
 
 def _detect_all_rows(image, rows: int) -> list[BBox]:
-    """
-    Детектор (см. detector.py) устроен так, что надёжно работает только
-    с одной полкой за раз — он анализирует, где на всю высоту переданного
-    кадра есть промежутки между товарами, а на фото с несколькими полками
-    сразу это не работает (промежуток на одной полке может быть занят
-    товаром на другой).
-
-    Поэтому для фото всего стеллажа делим кадр на `rows` равных
-    горизонтальных полос (по числу физических полок на фото, которое
-    сообщает пользователь) и прогоняем детекцию на каждой полосе отдельно,
-    а затем возвращаем все найденные рамки в координатах исходного кадра.
-    """
+    
     h_img = image.shape[0]
     row_height = h_img // rows
 
@@ -222,17 +144,6 @@ def _detect_all_rows(image, rows: int) -> list[BBox]:
 
 
 def labels_by_row(boxes: list[BBox], labels: list[str]) -> list:
-    """
-    Превращает плоский список найденных товаров (boxes + labels) в
-    список списков брендов по полкам — сверху вниз, внутри полки слева
-    направо. Нужен для сравнения с планограммой (см. planogram.py),
-    которая описывает выкладку именно в таком виде.
-
-    Если рамка представляет собой группу из нескольких вплотную стоящих
-    товаров одного бренда (см. BBox.count в detector.py), её метка
-    повторяется в списке count раз — планограмма описывает отдельные
-    физические позиции, а не найденные на фото рамки.
-    """
     rows_idx = group_into_rows(boxes)
     result = []
     for row in rows_idx:
